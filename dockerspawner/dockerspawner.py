@@ -151,7 +151,8 @@ class DockerSpawner(Spawner):
         )
     )
 
-    use_docker_links = Dict(
+    use_docker_links = Bool(
+        False,
         config=True,
         help=dedent(
             """
