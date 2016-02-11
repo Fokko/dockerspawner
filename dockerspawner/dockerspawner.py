@@ -165,6 +165,18 @@ class DockerSpawner(Spawner):
         )
     )
 
+    use_docker_links = Dict(
+        False,
+        config=True,
+        help=dedent(
+            """
+            If the Jupyterhub is running in a Docker container, this can be used
+            to connect using a Docker link, this simplifies the routing because
+            all traffic will be using docker hostnames.
+            """
+        )
+    )
+
     network_name = Unicode(
         "bridge",
         config=True,
@@ -375,6 +387,16 @@ class DockerSpawner(Spawner):
 
             if extra_host_config:
                 host_config.update(extra_host_config)
+
+            if self.use_docker_links:
+                containers = self.client.containers(quiet=True, filters={'org.jupyter.service': 'jupyterhub'})
+
+                if len(containers) > 0:
+                    container_id = containers[0]['Id']
+                    host_config['links'].update({container_id: 'jupyterhub'})
+                    self.log.info("Linked to container id %s", container_id)
+                else:
+                    self.log.warn("Could not find parent container id")
 
             self.log.debug("Starting host with config: %s", host_config)
 
