@@ -393,7 +393,7 @@ class DockerSpawner(Spawner):
 
                 self.log.debug("Found containers: %s", containers)
 
-                for container in containers
+                for container in containers:
                     if "jupyterhub" in container['Image']:
                         container_id = container['Id']
                         host_config['links'].update({container_id: 'jupyterhub'})
