@@ -389,14 +389,16 @@ class DockerSpawner(Spawner):
                 host_config.update(extra_host_config)
 
             if self.use_docker_links:
-                containers = self.client.containers(quiet=True, filters={'org.jupyter.service': 'jupyterhub'})
+                containers = self.client.containers(filters={'org.jupyter.service': 'jupyterhub'})
 
-                if len(containers) > 0:
-                    container_id = containers[0]['Id']
-                    host_config['links'].update({container_id: 'jupyterhub'})
-                    self.log.info("Linked to container id %s", container_id)
-                else:
-                    self.log.warn("Could not find parent container id")
+                self.log.debug("Found containers: %s", containers)
+
+                for container in containers
+                    if "jupyterhub" in container['Image']:
+                        container_id = container['Id']
+                        host_config['links'].update({container_id: 'jupyterhub'})
+                        self.log.info("Linked to container id %s", container_id)
+                        break;
 
             self.log.debug("Starting host with config: %s", host_config)
 
