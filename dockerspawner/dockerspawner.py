@@ -1,7 +1,7 @@
 """
 A Spawner for JupyterHub that runs each user's server in a separate docker container
 """
-import itertools
+
 import os
 import string
 from textwrap import dedent
@@ -19,6 +19,7 @@ from traitlets import (
     Dict,
     Unicode,
     Bool,
+    Int,
 )
 
 
@@ -71,7 +72,8 @@ class DockerSpawner(Spawner):
 
     container_id = Unicode()
     container_ip = Unicode('127.0.0.1', config=True)
-    container_image = Unicode("jupyter/singleuser", config=True)
+    container_port = Int(8888, min=1, max=65535, config=True)
+    container_image = Unicode("jupyterhub/singleuser", config=True)
     container_prefix = Unicode(
         "jupyter",
         config=True,
@@ -87,10 +89,17 @@ class DockerSpawner(Spawner):
         config=True,
         help=dedent(
             """
-            Map from host file/directory to container file/directory.
-            Volumes specified here will be read/write in the container.
-            If you use {username} in the host file / directory path, it will be
-            replaced with the current user's name.
+            Map from host file/directory to container (guest) file/directory
+            mount point and (optionally) a mode. When specifying the
+            guest mount point (bind) for the volume, you may use a
+            dict or str. If a str, then the volume will default to a
+            read-write (mode="rw"). With a dict, the bind is
+            identified by "bind" and the "mode" may be one of "rw"
+            (default), "ro" (read-only), "z" (public/shared SELinux
+            volume label), and "Z" (private/unshared SELinux volume
+            label). If you use {username} in either the host or guest
+            file/directory path, it will be replaced with the current
+            user's name.
             """
         )
     )
@@ -206,15 +215,10 @@ class DockerSpawner(Spawner):
         all the locations where you're going to mount volumes when you call
         create_container.
 
-        Returns a list of all the values in self.volumes or
+        Returns a sorted list of all the values in self.volumes or
         self.read_only_volumes.
         """
-        return list(
-            itertools.chain(
-                self.volumes.values(),
-                self.read_only_volumes.values(),
-            )
-        )
+        return sorted(map(lambda x: x['bind'], self.volume_binds.values()))
 
     @property
     def volume_binds(self):
@@ -224,19 +228,13 @@ class DockerSpawner(Spawner):
         looks like:
 
         {
-            host_location: {'bind': container_location, 'ro': True}
+            host_location: {'bind': container_location, 'mode': 'rw'}
         }
+        mode may be 'ro', 'rw', 'z', or 'Z'.
+
         """
-        volumes = {
-            key.format(username=self.user.name): {'bind': value.format(username=self.user.name), 'ro': False}
-            for key, value in self.volumes.items()
-        }
-        ro_volumes = {
-            key.format(username=self.user.name): {'bind': value.format(username=self.user.name), 'ro': True}
-            for key, value in self.read_only_volumes.items()
-        }
-        volumes.update(ro_volumes)
-        return volumes
+        binds = self._volumes_to_binds(self.volumes, {})
+        return self._volumes_to_binds(self.read_only_volumes, binds, mode='ro')
 
     _escaped_name = None
     @property
@@ -275,14 +273,17 @@ class DockerSpawner(Spawner):
         """Don't inherit any env from the parent process"""
         return []
 
-    def _env_default(self):
-        env = super(DockerSpawner, self)._env_default()
+    def get_env(self):
+        env = super(DockerSpawner, self).get_env()
         env.update(dict(
             JPY_USER=self.user.name,
             JPY_COOKIE_NAME=self.user.server.cookie_name,
             JPY_BASE_URL=self.user.server.base_url,
             JPY_HUB_PREFIX=self.hub.server.base_url
         ))
+
+        if self.notebook_dir:
+            env['NOTEBOOK_DIR'] = self.notebook_dir
 
         if self.hub_ip_connect:
            hub_api_url = self._public_hub_api_url()
@@ -345,6 +346,11 @@ class DockerSpawner(Spawner):
                 container = None
                 # my container is gone, forget my id
                 self.container_id = ''
+            elif e.response.status_code == 500:
+                self.log.info("Container '%s' is on unhealthy node", self.container_name)
+                container = None
+                # my container is unhealthy, forget my id
+                self.container_id = ''
             else:
                 raise
         return container
@@ -370,7 +376,7 @@ class DockerSpawner(Spawner):
             # build the dictionary of keyword arguments for create_container
             create_kwargs = dict(
                 image=image,
-                environment=self.env,
+                environment=self.get_env(),
                 volumes=self.volume_mount_points,
                 name=self.container_name)
             create_kwargs.update(self.extra_create_kwargs)
@@ -381,7 +387,7 @@ class DockerSpawner(Spawner):
             host_config = dict(binds=self.volume_binds, links=self.links)
 
             if not self.use_internal_ip:
-                host_config['port_bindings'] = {8888: (self.container_ip,)}
+                host_config['port_bindings'] = {self.container_port: (self.container_ip,)}
 
             host_config.update(self.extra_host_config)
 
@@ -431,11 +437,25 @@ class DockerSpawner(Spawner):
         # start the container
         yield self.docker('start', self.container_id, **start_kwargs)
 
-        ip, port = yield from self.get_ip_and_port()
+        ip, port = yield self.get_ip_and_port()
         self.user.server.ip = ip
         self.user.server.port = port
-
+    
+    @gen.coroutine
     def get_ip_and_port(self):
+        """Queries Docker daemon for container's IP and port.
+
+        If you are using network_mode=host, you will need to override
+        this method as follows::
+            
+            @gen.coroutine
+            def get_ip_and_port(self):
+                return self.container_ip, self.container_port
+
+        You will need to make sure container_ip and container_port
+        are correct, which depends on the route to the container
+        and the port it opens.
+        """
         if self.use_internal_ip:
             resp = yield self.docker('inspect_container', self.container_id)
             network_settings = resp['NetworkSettings']
@@ -443,10 +463,12 @@ class DockerSpawner(Spawner):
                 ip = self.get_network_ip(network_settings)
             else:  # Fallback for old versions of docker (<1.9) without network management
                 ip = network_settings['IPAddress']
-            port = 8888
+            port = self.container_port
         else:
-            resp = yield self.docker('port', self.container_id, 8888)
-            ip = self.container_ip
+            resp = yield self.docker('port', self.container_id, self.container_port)
+            if resp is None:
+                raise RuntimeError("Failed to get port info for %s" % self.container_id)
+            ip = resp[0]['HostIp']
             port = resp[0]['HostPort']
         return ip, port
 
@@ -482,3 +504,23 @@ class DockerSpawner(Spawner):
             yield self.docker('remove_container', self.container_id, v=True)
 
         self.clear_state()
+
+
+    def _volumes_to_binds(self, volumes, binds, mode='rw'):
+        """Extract the volume mount points from volumes property.
+
+        Returns a dict of dict entries of the form::
+
+            {'/host/dir': {'bind': '/guest/dir': 'mode': 'rw'}}
+        """
+        def _fmt(v):
+            return v.format(username=self.user.name)
+
+        for k, v in volumes.items():
+            m = mode
+            if isinstance(v, dict):
+                if 'mode' in v:
+                    m = v['mode']
+                v = v['bind']
+            binds[_fmt(k)] = {'bind': _fmt(v), 'mode': m}
+        return binds
